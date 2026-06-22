@@ -1,5 +1,6 @@
 import sys
 import io
+import math
 import re
 from typing import BinaryIO, Any
 
@@ -492,11 +493,338 @@ def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
     return [table_rows]
 
 
+# Characters whose text matrix has off-diagonal terms larger than this are
+# considered rotated (and therefore candidate watermark characters). A small
+# tolerance allows for negligible numerical skew in axis-aligned text.
+_ROTATION_TOLERANCE = 1e-3
+
+
+def _is_rotated_char(obj: dict) -> bool:
+    """
+    Return True if a pdfplumber character object is rotated.
+
+    A character's text matrix is ``(a, b, c, d, e, f)``. Axis-aligned (horizontal)
+    text has ``b == c == 0``; any rotation makes the off-diagonal terms ``b``/``c``
+    non-zero. Note that pdfplumber's ``upright`` flag is NOT a reliable rotation
+    signal -- a purely rotated glyph is still reported as ``upright`` because that
+    flag only detects mirrored/flipped text.
+    """
+    matrix = obj.get("matrix")
+    if not matrix or len(matrix) < 4:
+        return False
+    _a, b, c, _d = matrix[0], matrix[1], matrix[2], matrix[3]
+    return abs(b) > _ROTATION_TOLERANCE or abs(c) > _ROTATION_TOLERANCE
+
+
+# ---------------------------------------------------------------------------
+# Unified watermark detection (evidence fusion).
+#
+# No single signal is sufficient OR necessary to call text a watermark:
+#   * Rotation alone over-removes legitimately rotated text (vertical headers).
+#   * Repetition alone over-removes legitimate repeating content (a table's
+#     column-header row that prints on every page).
+#
+# So the two ideas are interwoven: rotation and cross-page repetition act as
+# *anchors*, but neither triggers removal on its own -- a run is only judged a
+# watermark when an anchor is corroborated by a second, independent family of
+# evidence (rotation / repetition / light color / oversized font / margin band).
+# This is the "you're-in-me, I'm-in-you" coupling: each plan's weakness is
+# covered by the other plan (or by a visual trait).
+# ---------------------------------------------------------------------------
+
+# Word/run positions are rounded to this grid (points, ~0.25 inch) so the same
+# text at the "same" place across pages matches despite minor jitter.
+_SIGNATURE_POSITION_BUCKET = 18.0
+# A run recurring on at least this fraction of pages counts as "repeated".
+_REPEAT_PAGE_FRACTION = 0.5
+# Color lightness (0=black .. 1=white) thresholds for the "light" family and the
+# stronger "very light" cosmetic anchor.
+_LIGHT_THRESHOLD = 0.55
+_VERY_LIGHT_THRESHOLD = 0.70
+# A run this many times larger than the body's median glyph size is "oversized".
+_OVERSIZE_MULTIPLE = 1.5
+# Fraction of page height treated as the top/bottom margin band (header/footer).
+_MARGIN_BAND_FRACTION = 0.08
+# Line grouping tolerance (points) when assembling characters into runs.
+_LINE_TOLERANCE = 3.0
+
+
+def _word_signature(word: dict, bucket: float = _SIGNATURE_POSITION_BUCKET) -> tuple:
+    """Build a (normalized_text, x_bucket, y_bucket) signature for a word/run.
+
+    Position is included so that only text appearing at the *same place* across
+    pages is treated as repeated; coincidental word repetition in flowing body
+    text (which moves around the page) is not flagged.
+    """
+    text = re.sub(r"\s+", " ", word.get("text", "")).strip().lower()
+    x_bucket = round(word.get("x0", 0.0) / bucket)
+    y_bucket = round(word.get("top", 0.0) / bucket)
+    return (text, x_bucket, y_bucket)
+
+
+def _color_lightness(color: Any) -> float:
+    """Return a 0 (black) .. 1 (white) lightness estimate for a pdfplumber color.
+
+    Handles ``None`` (assumed dark), grayscale scalars, RGB, and CMYK tuples,
+    normalizing 0-255 values to 0-1 when necessary.
+    """
+    if color is None:
+        return 0.0
+
+    def _norm(values: list) -> list:
+        return [v / 255.0 if v > 1.0 else float(v) for v in values]
+
+    if isinstance(color, (int, float)):
+        return max(0.0, min(1.0, _norm([color])[0]))
+    if isinstance(color, (tuple, list)):
+        nums = [c for c in color if isinstance(c, (int, float))]
+        if not nums:
+            return 0.0
+        if len(nums) == 1:
+            return max(0.0, min(1.0, _norm(nums)[0]))
+        if len(nums) >= 4:  # CMYK
+            c, m, y, k = _norm(nums[:4])
+            r, g, b = (1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)
+        else:  # RGB (or anything else with 2-3 components)
+            rgb = _norm(nums[:3])
+            while len(rgb) < 3:
+                rgb.append(rgb[-1])
+            r, g, b = rgb[0], rgb[1], rgb[2]
+        return max(0.0, min(1.0, (max(r, g, b) + min(r, g, b)) / 2.0))
+    return 0.0
+
+
+def _extract_runs(page: Any) -> list:
+    """
+    Group a page's characters into text runs with watermark-relevant features.
+
+    Each run is a dict with: ``text``, ``x0``/``x1``/``top``/``bottom`` (bbox),
+    ``rotated`` (bool), ``lightness`` (0..1), and ``size`` (median glyph size).
+    Runs -- rather than pdfplumber words -- are used so we can attach rotation,
+    color, and size, which words do not expose. Run text is only used internally
+    (for repetition signatures and bbox removal), never emitted as output.
+    """
+    chars = getattr(page, "chars", None) or []
+    if not chars:
+        return []
+
+    ordered = sorted(chars, key=lambda c: (round(c["top"] / _LINE_TOLERANCE), c["x0"]))
+
+    runs: list = []
+    cur: dict = {}
+    for ch in ordered:
+        line_key = round(ch["top"] / _LINE_TOLERANCE)
+        rotated = _is_rotated_char(ch)
+        size = float(ch.get("size", 0.0) or 0.0)
+        gap_threshold = max(4.0, 0.6 * size)
+
+        if (
+            cur
+            and cur["line_key"] == line_key
+            and cur["rotated"] == rotated
+            and (ch["x0"] - cur["x1"]) <= gap_threshold
+        ):
+            cur["text"] += ch.get("text", "")
+            cur["x1"] = max(cur["x1"], ch["x1"])
+            cur["top"] = min(cur["top"], ch["top"])
+            cur["bottom"] = max(cur["bottom"], ch["bottom"])
+            cur["_sizes"].append(size)
+            cur["_lights"].append(_color_lightness(ch.get("non_stroking_color")))
+        else:
+            if cur:
+                runs.append(_finalize_run(cur))
+            cur = {
+                "line_key": line_key,
+                "rotated": rotated,
+                "text": ch.get("text", ""),
+                "x0": ch["x0"],
+                "x1": ch["x1"],
+                "top": ch["top"],
+                "bottom": ch["bottom"],
+                "_sizes": [size],
+                "_lights": [_color_lightness(ch.get("non_stroking_color"))],
+            }
+    if cur:
+        runs.append(_finalize_run(cur))
+    return runs
+
+
+def _finalize_run(run: dict) -> dict:
+    """Collapse a run's per-char sample lists into median feature values."""
+    sizes = sorted(run.pop("_sizes"))
+    lights = sorted(run.pop("_lights"))
+    run["size"] = sizes[len(sizes) // 2] if sizes else 0.0
+    run["lightness"] = lights[len(lights) // 2] if lights else 0.0
+    return run
+
+
+def _analyze_watermarks(pdf: Any) -> dict:
+    """
+    First pass: gather document-level statistics needed for watermark scoring.
+
+    Returns the per-page repetition counts of run signatures and the median body
+    glyph size. Page caches are released as we go to preserve constant memory.
+    """
+    num_pages = len(pdf.pages)
+    repeat_counts: dict = {}
+    all_sizes: list = []
+
+    for page in pdf.pages:
+        seen: set = set()
+        for run in _extract_runs(page):
+            if run["size"] > 0:
+                all_sizes.append(run["size"])
+            sig = _word_signature(run)
+            if sig[0] and sig not in seen:
+                seen.add(sig)
+                repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
+        page.close()  # Release cached data; pass 2 re-parses on demand.
+
+    all_sizes.sort()
+    body_median_size = all_sizes[len(all_sizes) // 2] if all_sizes else 0.0
+    return {
+        "num_pages": num_pages,
+        "repeat_counts": repeat_counts,
+        "body_median_size": body_median_size,
+    }
+
+
+def _is_watermark_run(run: dict, page: Any, analysis: dict) -> bool:
+    """
+    Fuse evidence to decide whether a text run is a watermark / boilerplate.
+
+    A run is removed only when an *anchor* (rotation, cross-page repetition, or a
+    strong cosmetic stamp) is present AND at least two independent evidence
+    families agree. Families: rotation, repetition, light color, oversized font,
+    and margin band (header/footer zone).
+    """
+    num_pages = analysis["num_pages"]
+    body_median = analysis["body_median_size"]
+
+    # --- individual evidence families ---
+    f_rotation = run["rotated"]
+
+    rep_fraction = 0.0
+    if num_pages >= 2:
+        count = analysis["repeat_counts"].get(_word_signature(run), 0)
+        rep_fraction = count / num_pages
+    f_repetition = rep_fraction >= _REPEAT_PAGE_FRACTION
+
+    f_light = run["lightness"] >= _LIGHT_THRESHOLD
+    f_oversize = body_median > 0 and run["size"] >= _OVERSIZE_MULTIPLE * body_median
+
+    page_height = float(getattr(page, "height", 0.0) or 0.0)
+    center_y = (run["top"] + run["bottom"]) / 2.0
+    f_margin = page_height > 0 and (
+        center_y <= _MARGIN_BAND_FRACTION * page_height
+        or center_y >= (1.0 - _MARGIN_BAND_FRACTION) * page_height
+    )
+
+    family_count = sum(
+        (f_rotation, f_repetition, f_light, f_oversize, f_margin)
+    )
+
+    # --- anchors ---
+    # A purely cosmetic centered stamp (very light + oversized + centered) can
+    # anchor on its own even without rotation/repetition (e.g., single-page docs).
+    page_width = float(getattr(page, "width", 0.0) or 0.0)
+    center_x = (run["x0"] + run["x1"]) / 2.0
+    centered = (
+        page_width > 0
+        and page_height > 0
+        and 0.35 * page_width <= center_x <= 0.65 * page_width
+        and _MARGIN_BAND_FRACTION * page_height
+        < center_y
+        < (1.0 - _MARGIN_BAND_FRACTION) * page_height
+    )
+    cosmetic_anchor = (
+        run["lightness"] >= _VERY_LIGHT_THRESHOLD and f_oversize and centered
+    )
+
+    has_anchor = f_rotation or f_repetition or cosmetic_anchor
+    return has_anchor and family_count >= 2
+
+
+def _watermark_bboxes_for_page(
+    page: Any, analysis: dict
+) -> tuple:
+    """
+    Second pass (per page): return bounding boxes of watermark runs.
+
+    Rotated and horizontal watermarks are returned separately so the page filter
+    can delete rotated watermark glyphs *without* removing horizontal body text
+    that happens to lie beneath a large diagonal stamp's bounding box.
+    """
+    rotated_bboxes: list = []
+    horizontal_bboxes: list = []
+    for run in _extract_runs(page):
+        if not run["text"].strip():
+            continue
+        if _is_watermark_run(run, page, analysis):
+            bbox = (run["x0"], run["top"], run["x1"], run["bottom"])
+            if run["rotated"]:
+                rotated_bboxes.append(bbox)
+            else:
+                horizontal_bboxes.append(bbox)
+    return rotated_bboxes, horizontal_bboxes
+
+
+def _char_in_bboxes(obj: dict, bboxes: list, eps: float = 0.5) -> bool:
+    """Return True if a character's center falls within any of the bounding boxes."""
+    cx = (obj.get("x0", 0.0) + obj.get("x1", 0.0)) / 2
+    cy = (obj.get("top", 0.0) + obj.get("bottom", 0.0)) / 2
+    for x0, top, x1, bottom in bboxes:
+        if x0 - eps <= cx <= x1 + eps and top - eps <= cy <= bottom + eps:
+            return True
+    return False
+
+
+def _filter_watermark_chars(page: Any, rotated_bboxes: list, horizontal_bboxes: list) -> Any:
+    """
+    Return a filtered page view with watermark characters removed.
+
+    * Characters whose center is inside a horizontal watermark bbox are dropped.
+    * Characters inside a rotated watermark bbox are dropped only if they are
+      themselves rotated -- this preserves upright body text sitting underneath a
+      large diagonal stamp.
+    """
+    if not rotated_bboxes and not horizontal_bboxes:
+        return page
+
+    def _keep(obj: dict) -> bool:
+        if obj.get("object_type") != "char":
+            return True
+        if horizontal_bboxes and _char_in_bboxes(obj, horizontal_bboxes):
+            return False
+        if (
+            rotated_bboxes
+            and _is_rotated_char(obj)
+            and _char_in_bboxes(obj, rotated_bboxes)
+        ):
+            return False
+        return True
+
+    return page.filter(_keep)
+
+
 class PdfConverter(DocumentConverter):
     """
     Converts PDFs to Markdown.
     Supports extracting tables into aligned Markdown format (via pdfplumber).
     Falls back to pdfminer if pdfplumber is missing or fails.
+
+    Set ``pdf_remove_watermarks=True`` (e.g.,
+    ``md.convert("file.pdf", pdf_remove_watermarks=True)``) to remove text
+    watermarks and repeated header/footer boilerplate during extraction. It is
+    disabled by default.
+
+    Detection fuses several signals so that no single trait over-removes content:
+    rotation and cross-page repetition act as anchors, and a run is only removed
+    when an anchor is corroborated by a second independent family of evidence
+    (rotation, repetition, light color, oversized font, or margin band). As a
+    result, a lone vertical table header (rotated only) or a repeating in-body
+    table header (repeated only) is preserved, while a diagonal "CONFIDENTIAL"
+    stamp or a repeated margin header/footer is removed.
     """
 
     def accepts(
@@ -536,6 +864,10 @@ class PdfConverter(DocumentConverter):
 
         assert isinstance(file_stream, io.IOBase)
 
+        # Opt-in watermark / boilerplate removal via evidence fusion
+        # (see _is_watermark_run / _analyze_watermarks).
+        remove_watermarks = bool(kwargs.get("pdf_remove_watermarks", False))
+
         # Read file stream into BytesIO for compatibility with pdfplumber
         pdf_bytes = io.BytesIO(file_stream.read())
 
@@ -550,8 +882,23 @@ class PdfConverter(DocumentConverter):
             plain_page_indices: list[int] = []
 
             with pdfplumber.open(pdf_bytes) as pdf:
+                # When removing watermarks, first gather document-level stats
+                # (repetition counts, body font size) used to score each run.
+                # This extra pass releases page caches as it goes.
+                analysis = _analyze_watermarks(pdf) if remove_watermarks else None
+
                 for page_idx, page in enumerate(pdf.pages):
-                    page_content = _extract_form_content_from_words(page)
+                    # When enabled, run extraction against a filtered view of the
+                    # page with watermark/boilerplate characters removed.
+                    work_page = page
+                    if analysis is not None:
+                        rot_bboxes, horiz_bboxes = _watermark_bboxes_for_page(
+                            page, analysis
+                        )
+                        work_page = _filter_watermark_chars(
+                            page, rot_bboxes, horiz_bboxes
+                        )
+                    page_content = _extract_form_content_from_words(work_page)
 
                     if page_content is not None:
                         form_page_count += 1
@@ -559,7 +906,7 @@ class PdfConverter(DocumentConverter):
                             markdown_chunks.append(page_content)
                     else:
                         plain_page_indices.append(page_idx)
-                        text = page.extract_text()
+                        text = work_page.extract_text()
                         if text and text.strip():
                             markdown_chunks.append(text.strip())
 
@@ -567,19 +914,25 @@ class PdfConverter(DocumentConverter):
 
             # If no pages had form-style content, use pdfminer for
             # the whole document (better text spacing for prose).
-            if form_page_count == 0:
+            #
+            # The whole-document pdfminer path cannot be filtered, so when
+            # watermark removal is requested we keep the per-page text collected
+            # from the filtered pages instead.
+            if form_page_count == 0 and not remove_watermarks:
                 pdf_bytes.seek(0)
                 markdown = pdfminer.high_level.extract_text(pdf_bytes)
             else:
                 markdown = "\n\n".join(markdown_chunks).strip()
 
         except Exception:
-            # Fallback if pdfplumber fails
+            # Fallback if pdfplumber fails. This path is unfiltered; a hard
+            # pdfplumber failure takes priority over watermark removal.
             pdf_bytes.seek(0)
             markdown = pdfminer.high_level.extract_text(pdf_bytes)
 
-        # Fallback if still empty
-        if not markdown:
+        # Fallback if still empty. Skipped when removing watermarks, since the
+        # unfiltered pdfminer pass would reintroduce the removed text.
+        if not markdown and not remove_watermarks:
             pdf_bytes.seek(0)
             markdown = pdfminer.high_level.extract_text(pdf_bytes)
 
